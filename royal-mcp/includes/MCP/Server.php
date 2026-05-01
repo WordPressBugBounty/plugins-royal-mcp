@@ -515,6 +515,18 @@ class Server {
      * Per MCP spec: Opens SSE stream for server notifications
      */
     private function handle_get_stream($request) {
+        // SSE / server-initiated messages are not supported on this host.
+        // Return 405 so MCP clients (e.g. mcp-remote) do not retry the stream.
+        $response = new \WP_REST_Response([
+            'jsonrpc' => '2.0',
+            'error' => [
+                'code' => -32600,
+                'message' => 'Server-sent events (SSE) are not supported. Use HTTP POST for all MCP communication.',
+            ],
+        ], 405);
+        $response->header('Allow', 'POST, DELETE, OPTIONS');
+        return $response;
+
         // Authenticate before any session logic.
         $auth_check = $this->validate_auth($request);
         if ($auth_check !== true) {
@@ -786,7 +798,7 @@ class Server {
                     'jsonrpc' => '2.0',
                     'id' => $id,
                     'result' => [
-                        'protocolVersion' => '2025-03-26',
+                        'protocolVersion' => '2025-11-25',
                         'serverInfo' => [
                             'name' => 'Royal MCP WordPress',
                             'version' => ROYAL_MCP_VERSION,
@@ -1009,12 +1021,19 @@ class Server {
             case 'wp_get_taxonomies':
                 $taxonomies = get_taxonomies(['public' => true], 'objects');
                 return array_values(array_map(function($tax) {
+                    // 1.4.12 — `slug` added as a clearer alias for the taxonomy
+                    // identifier. WP_Taxonomy uses `name` for the slug for
+                    // historical reasons, which surprises AI agents that
+                    // expect a `slug` field on something called a "taxonomy".
+                    // Both fields hold the same value; keep `name` for
+                    // backward compat with anything already using it.
                     return [
-                        'name' => $tax->name,
-                        'label' => $tax->label,
-                        'description' => $tax->description,
+                        'slug'         => $tax->name,
+                        'name'         => $tax->name,
+                        'label'        => $tax->label,
+                        'description'  => $tax->description,
                         'hierarchical' => (bool) $tax->hierarchical,
-                        'object_type' => array_values((array) $tax->object_type),
+                        'object_type'  => array_values((array) $tax->object_type),
                         'show_in_rest' => (bool) $tax->show_in_rest,
                     ];
                 }, $taxonomies));
@@ -1278,10 +1297,22 @@ class Server {
             case 'wp_get_term_meta':
                 $term_id = intval($args['term_id']);
                 if (!get_term($term_id)) throw new \Exception('Term not found');
+                // 1.4.12 — wrap return in a structured object for consistency
+                // with wp_update_term_meta / wp_delete_term_meta which return
+                // structured arrays. Single-key get returns {term_id, key,
+                // value}; full-meta get returns {term_id, meta: {...}}.
                 if (!empty($args['key'])) {
-                    return get_term_meta($term_id, sanitize_text_field($args['key']), true);
+                    $key = sanitize_text_field($args['key']);
+                    return [
+                        'term_id' => $term_id,
+                        'key'     => $key,
+                        'value'   => get_term_meta($term_id, $key, true),
+                    ];
                 }
-                return get_term_meta($term_id);
+                return [
+                    'term_id' => $term_id,
+                    'meta'    => (array) get_term_meta($term_id),
+                ];
 
             case 'wp_update_term_meta':
                 $term_id = intval($args['term_id']);
