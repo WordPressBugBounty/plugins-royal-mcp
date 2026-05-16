@@ -436,9 +436,9 @@ class Server {
             ['name' => 'wp_get_menus', 'description' => 'Get navigation menus', 'inputSchema' => ['type' => 'object', 'properties' => new \stdClass()]],
             ['name' => 'wp_get_menu_items', 'description' => 'Get menu items', 'inputSchema' => ['type' => 'object', 'properties' => ['menu_id' => ['type' => 'integer']], 'required' => ['menu_id']]],
             ['name' => 'wp_create_menu_item', 'description' => 'Create a menu item in a navigation menu. Requires edit_theme_options capability.', 'inputSchema' => ['type' => 'object', 'properties' => ['menu_id' => ['type' => 'integer'], 'title' => ['type' => 'string'], 'url' => ['type' => 'string', 'description' => 'External URL (leave empty if linking to a post/page via object_id)'], 'object_id' => ['type' => 'integer', 'description' => 'WordPress object ID (post, page, or term)'], 'object_type' => ['type' => 'string', 'enum' => ['post', 'page', 'category', 'custom'], 'description' => 'Type of object being linked (default: custom)'], 'parent_id' => ['type' => 'integer', 'description' => 'Parent menu item ID for nested items (0 = top level)'], 'position' => ['type' => 'integer', 'description' => 'Position in menu order (default: end)'], 'target' => ['type' => 'string', 'enum' => ['_self', '_blank'], 'description' => 'Link target']], 'required' => ['menu_id', 'title']]],
-            ['name' => 'wp_update_menu_item', 'description' => 'Update an existing menu item. Requires edit_theme_options capability.', 'inputSchema' => ['type' => 'object', 'properties' => ['menu_item_id' => ['type' => 'integer'], 'title' => ['type' => 'string'], 'url' => ['type' => 'string'], 'parent_id' => ['type' => 'integer'], 'position' => ['type' => 'integer'], 'target' => ['type' => 'string', 'enum' => ['_self', '_blank']]], 'required' => ['menu_item_id']]],
+            ['name' => 'wp_update_menu_item', 'description' => 'Update an existing menu item. Only the fields you pass will change; unspecified fields are preserved from the existing item. The tool will refuse explicit-empty values for title or url that would destroy a non-empty existing value — to intentionally clear those, use wp_delete_menu_item then wp_create_menu_item. Requires edit_theme_options capability.', 'inputSchema' => ['type' => 'object', 'properties' => ['menu_item_id' => ['type' => 'integer'], 'title' => ['type' => 'string'], 'url' => ['type' => 'string'], 'parent_id' => ['type' => 'integer'], 'position' => ['type' => 'integer'], 'target' => ['type' => 'string', 'enum' => ['_self', '_blank']]], 'required' => ['menu_item_id']]],
             ['name' => 'wp_delete_menu_item', 'description' => 'Delete a menu item. Requires edit_theme_options capability.', 'inputSchema' => ['type' => 'object', 'properties' => ['menu_item_id' => ['type' => 'integer']], 'required' => ['menu_item_id']]],
-            ['name' => 'wp_reorder_menu_items', 'description' => 'Reorder menu items by passing an array of menu_item_ids in the desired order. Requires edit_theme_options capability.', 'inputSchema' => ['type' => 'object', 'properties' => ['menu_id' => ['type' => 'integer'], 'item_order' => ['type' => 'array', 'items' => ['type' => 'integer'], 'description' => 'Array of menu_item_ids in the desired order']], 'required' => ['menu_id', 'item_order']]],
+            ['name' => 'wp_reorder_menu_items', 'description' => 'Reorder menu items by passing an array of menu_item_ids in the desired order. Existing titles, URLs, parents, and other fields are preserved on every item touched. If the response includes a "skipped" array, those items could not be safely reordered (e.g. missing or recently deleted) — the rest were reordered correctly. Safe recovery procedure if a menu ever ends up in an unexpected state: wp_delete_menu_item each item, then wp_create_menu_item with both parent_id and position specified in every call. Requires edit_theme_options capability.', 'inputSchema' => ['type' => 'object', 'properties' => ['menu_id' => ['type' => 'integer'], 'item_order' => ['type' => 'array', 'items' => ['type' => 'integer'], 'description' => 'Array of menu_item_ids in the desired order']], 'required' => ['menu_id', 'item_order']]],
 
             // Plugins & Themes
             ['name' => 'wp_get_plugins', 'description' => 'Get installed plugins', 'inputSchema' => ['type' => 'object', 'properties' => new \stdClass()]],
@@ -541,16 +541,33 @@ class Server {
     }
 
     /**
-     * Handle GET - SSE stream for server-initiated messages
+     * Handle GET - tri-state response for the MCP Streamable HTTP endpoint
      *
-     * Auth check goes FIRST per RFC 9728 (Protected Resource Metadata) —
-     * unauthenticated GET must return 401 + WWW-Authenticate so RFC 9728-aware
-     * clients (Claude.ai web, ChatGPT) can discover OAuth and start the flow.
+     * The single /mcp endpoint is hit by multiple clients with conflicting
+     * probe behavior. Each "fix" we've shipped has broken a different client.
+     * This is the 4th iteration. Auth check FIRST (RFC 9728), then dispatch by
+     * User-Agent so each client gets its expected behavior:
      *
-     * Authenticated GET then returns 405 since this server does not host SSE,
-     * preserving the 1.4.12 fix that stopped mcp-remote retry storms.
+     *  1. Unauthenticated GET (any UA) →
+     *     401 + WWW-Authenticate: Bearer resource_metadata="..."
+     *     (RFC 9728 — required for Claude.ai web / ChatGPT pre-OAuth discovery.
+     *     Handled inside validate_auth().)
      *
-     * See _dev/MCP_ENDPOINT_BEHAVIOR_MATRIX.md before changing.
+     *  2. Authenticated GET + UA contains "Claude-User" →
+     *     200 + Content-Type: text/event-stream + a minimal keepalive comment.
+     *     This is Anthropic's post-OAuth session-establishment probe. Without
+     *     it Anthropic retries the GET four times then gives up, so the entire
+     *     OAuth flow (which succeeded at /token in 1.4.17) still fails to
+     *     produce a working session. Added in 1.4.18.
+     *
+     *  3. Authenticated GET + any other UA (mcp-remote, node-fetch, etc.) →
+     *     405 + Allow: POST, DELETE, OPTIONS.
+     *     Preserves the 1.4.12 fix that stopped mcp-remote retry storms. The
+     *     MCP Streamable HTTP spec says servers MAY support GET for SSE and
+     *     MUST return 405 if they don't — both are spec-compliant. mcp-remote
+     *     handles 405 cleanly by falling back to POST-only.
+     *
+     * See _internal/royal-mcp/MCP_ENDPOINT_BEHAVIOR_MATRIX.md before changing.
      */
     private function handle_get_stream($request) {
         $auth_check = $this->validate_auth($request);
@@ -558,13 +575,36 @@ class Server {
             return $auth_check;
         }
 
-        // Authenticated client — SSE not hosted here, return 405 so mcp-remote
-        // falls back to POST-only mode instead of retrying.
+        // Anthropic post-OAuth session probe — return 200 + SSE keepalive and
+        // exit early. Can't use WP_REST_Response here because it auto-JSON-
+        // encodes the body, which would corrupt SSE format. We have nothing
+        // server-initiated to push, so a single keepalive comment followed by
+        // clean termination is the minimum spec-compliant response.
+        $user_agent = $request->get_header('User-Agent');
+        if (is_string($user_agent) && stripos($user_agent, 'Claude-User') !== false) {
+            while (ob_get_level()) {
+                ob_end_clean();
+            }
+            status_header(200);
+            header('Content-Type: text/event-stream; charset=utf-8');
+            header('Cache-Control: no-store, no-cache, must-revalidate, private');
+            header('Pragma: no-cache');
+            header('Connection: keep-alive');
+            header('X-Accel-Buffering: no'); // Disable nginx buffering
+            echo ": royal-mcp-keepalive\n\n";
+            if (function_exists('fastcgi_finish_request')) {
+                fastcgi_finish_request();
+            }
+            exit;
+        }
+
+        // All other authenticated clients (mcp-remote, custom scripts) — SSE
+        // not hosted here. 405 with Allow header so they fall back to POST.
         $response = new \WP_REST_Response([
             'jsonrpc' => '2.0',
             'error' => [
                 'code' => -32600,
-                'message' => 'Server-sent events (SSE) are not supported. Use HTTP POST for all MCP communication.',
+                'message' => 'Server-sent events (SSE) are not supported on this client. Use HTTP POST for all MCP communication.',
             ],
         ], 405);
         $response->header('Allow', 'POST, DELETE, OPTIONS');
@@ -915,6 +955,7 @@ class Server {
 
         try {
             $result = $this->execute_tool($name, $args);
+            $this->log_tool_call($name, $args, 'success', null);
             return [
                 'jsonrpc' => '2.0',
                 'id' => $id,
@@ -926,6 +967,7 @@ class Server {
                 ],
             ];
         } catch (\Exception $e) {
+            $this->log_tool_call($name, $args, 'error', $e->getMessage());
             return [
                 'jsonrpc' => '2.0',
                 'id' => $id,
@@ -938,6 +980,47 @@ class Server {
                 ],
             ];
         }
+    }
+
+    /**
+     * Log an MCP tool call to wp_royal_mcp_logs.
+     *
+     * STRICT SAFELIST: logs the tool name and the KEYS of the argument array,
+     * but NEVER the argument VALUES. Tool arguments can contain arbitrary
+     * customer data (post content, search queries with PII, user-supplied
+     * credentials passed through, etc.) — keys alone tell us "what was called"
+     * without leaking "what data." Error messages from the tool dispatcher are
+     * our own strings, safe to log.
+     *
+     * Added 1.4.17 to close the observability gap where the modern /mcp endpoint
+     * was producing zero Activity Log entries even when actively serving tool
+     * calls — making customers think the connection was broken.
+     */
+    private function log_tool_call($tool_name, $args, $status, $error_message) {
+        global $wpdb;
+
+        $request_meta = [
+            'tool'     => (string) $tool_name,
+            'arg_keys' => is_array($args) ? array_keys($args) : [],
+        ];
+
+        $response_meta = [ 'status' => $status ];
+        if ('error' === $status && $error_message) {
+            $response_meta['error'] = (string) $error_message;
+        }
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Intentional direct insert to the logs table.
+        $wpdb->insert(
+            $wpdb->prefix . 'royal_mcp_logs',
+            [
+                'mcp_server'    => 'MCP Server',
+                'action'        => 'tools/call:' . sanitize_text_field((string) $tool_name),
+                'request_data'  => wp_json_encode($request_meta),
+                'response_data' => wp_json_encode($response_meta),
+                'status'        => 'success' === $status ? 'success' : 'error',
+            ],
+            ['%s', '%s', '%s', '%s', '%s']
+        );
     }
 
     private function execute_tool($name, $args) {
@@ -1639,13 +1722,21 @@ class Server {
                 }
                 $menus = wp_get_post_terms($item_id, 'nav_menu', ['fields' => 'ids']);
                 $menu_id = (!empty($menus) && !is_wp_error($menus)) ? (int) $menus[0] : 0;
-                $update_args = ['menu-item-status' => 'publish'];
-                if (isset($args['title']))     $update_args['menu-item-title']     = sanitize_text_field($args['title']);
-                if (isset($args['url']))       $update_args['menu-item-url']       = esc_url_raw($args['url']);
-                if (isset($args['parent_id'])) $update_args['menu-item-parent-id'] = intval($args['parent_id']);
-                if (isset($args['position']))  $update_args['menu-item-position']  = intval($args['position']);
-                if (isset($args['target']))    $update_args['menu-item-target']    = sanitize_text_field($args['target']);
-                $result = wp_update_nav_menu_item($menu_id, $item_id, $update_args);
+                // Build overrides from caller-supplied fields only. The helper
+                // reads existing values and merges so unspecified fields are
+                // preserved — fixes the 1.4.17 destructive bug where partial
+                // args zeroed title/url/parent on the existing item.
+                $overrides = [];
+                if (isset($args['title']))     $overrides['menu-item-title']     = sanitize_text_field($args['title']);
+                if (isset($args['url']))       $overrides['menu-item-url']       = esc_url_raw($args['url']);
+                if (isset($args['parent_id'])) $overrides['menu-item-parent-id'] = intval($args['parent_id']);
+                if (isset($args['position']))  $overrides['menu-item-position']  = intval($args['position']);
+                if (isset($args['target']))    $overrides['menu-item-target']    = sanitize_text_field($args['target']);
+                $merged = $this->build_safe_menu_item_args($item_id, $overrides);
+                if (is_wp_error($merged)) {
+                    throw new \Exception(esc_html($merged->get_error_message()));
+                }
+                $result = wp_update_nav_menu_item($menu_id, $item_id, $merged);
                 if (is_wp_error($result)) throw new \Exception(esc_html($result->get_error_message()));
                 return ['menu_item_id' => $item_id, 'menu_id' => $menu_id];
 
@@ -1672,17 +1763,38 @@ class Server {
                 }
                 $order = $args['item_order'] ?? [];
                 if (!is_array($order)) throw new \Exception('item_order must be an array of menu_item_ids.');
+                // For each item, read existing values then send a full args
+                // payload with only menu-item-position overridden. Sending
+                // partial args here was the 1.4.17 destructive bug — WP merges
+                // with defaults, wiping title/url/parent on every item touched.
                 $position = 1;
+                $reordered = [];
+                $skipped = [];
                 foreach ($order as $iid) {
                     $iid = intval($iid);
-                    if ($iid <= 0) continue;
-                    wp_update_nav_menu_item($menu_id, $iid, [
+                    if ($iid <= 0) {
+                        continue;
+                    }
+                    $merged = $this->build_safe_menu_item_args($iid, [
                         'menu-item-position' => $position,
-                        'menu-item-status'   => 'publish',
                     ]);
+                    if (is_wp_error($merged)) {
+                        $skipped[] = ['menu_item_id' => $iid, 'reason' => $merged->get_error_message()];
+                        continue;
+                    }
+                    $result = wp_update_nav_menu_item($menu_id, $iid, $merged);
+                    if (is_wp_error($result)) {
+                        $skipped[] = ['menu_item_id' => $iid, 'reason' => $result->get_error_message()];
+                        continue;
+                    }
+                    $reordered[] = $iid;
                     $position++;
                 }
-                return ['success' => true, 'menu_id' => $menu_id, 'count' => $position - 1];
+                $response = ['success' => true, 'menu_id' => $menu_id, 'count' => count($reordered), 'reordered' => $reordered];
+                if (!empty($skipped)) {
+                    $response['skipped'] = $skipped;
+                }
+                return $response;
 
             // ==================== PLUGINS & THEMES ====================
             case 'wp_get_plugins':
@@ -1974,6 +2086,74 @@ class Server {
                 }
                 throw new \Exception('Unknown tool: ' . esc_html($name));
         }
+    }
+
+    /**
+     * Build menu-item update args that preserve existing values for any field
+     * not in $overrides. Without this read-merge-write pattern, callers passing
+     * partial args to wp_update_nav_menu_item() silently zero title/url/parent
+     * on the existing item — the destructive bug reported in
+     * royalplugins/royal-mcp issue #14 (dmcaughtry-photo, 2026-05-12).
+     *
+     * Returns an array suitable for wp_update_nav_menu_item(), or WP_Error if
+     * the item doesn't exist, the merge would still destroy a non-empty
+     * existing field, or the caller explicitly passed empty for a destructive
+     * field that's currently non-empty.
+     *
+     * @param int   $item_id   Menu item post ID.
+     * @param array $overrides Caller-supplied fields keyed by wp_update_nav_menu_item arg name (e.g. 'menu-item-title').
+     * @return array|\WP_Error
+     */
+    private function build_safe_menu_item_args($item_id, $overrides) {
+        $post = get_post($item_id);
+        if (!$post || $post->post_type !== 'nav_menu_item') {
+            return new \WP_Error('item_not_found', "Menu item {$item_id} not found.");
+        }
+        $existing = wp_setup_nav_menu_item($post);
+        if (!$existing || is_wp_error($existing)) {
+            return new \WP_Error('item_setup_failed', "Could not read menu item {$item_id} for safe merge.");
+        }
+        $classes = $existing->classes ?? '';
+        if (is_array($classes)) {
+            $classes = implode(' ', $classes);
+        }
+        $base = [
+            'menu-item-db-id'       => (int) $item_id,
+            'menu-item-object-id'   => (int) ($existing->object_id ?? 0),
+            'menu-item-object'      => (string) ($existing->object ?? ''),
+            'menu-item-parent-id'   => (int) ($existing->menu_item_parent ?? 0),
+            'menu-item-position'    => (int) ($existing->menu_order ?? 0),
+            'menu-item-type'        => (string) ($existing->type ?? 'custom'),
+            'menu-item-title'       => (string) ($existing->title ?? ''),
+            'menu-item-url'         => (string) ($existing->url ?? ''),
+            'menu-item-description' => (string) ($existing->description ?? ''),
+            'menu-item-attr-title'  => (string) ($existing->attr_title ?? ''),
+            'menu-item-target'      => (string) ($existing->target ?? ''),
+            'menu-item-classes'     => (string) $classes,
+            'menu-item-xfn'         => (string) ($existing->xfn ?? ''),
+            'menu-item-status'      => 'publish',
+        ];
+        // Destructive-operation guardrail: refuse if the caller explicitly
+        // passed an empty value for a destructive-relevant field that's
+        // currently non-empty. Catches the AI-agent failure mode where
+        // partial args spell out empty strings for fields they didn't mean
+        // to change. To clear a field intentionally, delete + recreate the
+        // item instead.
+        $destructive_fields = ['menu-item-title', 'menu-item-url'];
+        foreach ($destructive_fields as $arg_key) {
+            if (!array_key_exists($arg_key, $overrides)) {
+                continue;
+            }
+            $existing_value = (string) ($base[$arg_key] ?? '');
+            $new_value = (string) $overrides[$arg_key];
+            if ($existing_value !== '' && $new_value === '') {
+                return new \WP_Error(
+                    'destructive_operation_blocked',
+                    "Refused: passing empty '{$arg_key}' would zero a non-empty value on menu item {$item_id}. To clear intentionally, use wp_delete_menu_item + wp_create_menu_item."
+                );
+            }
+        }
+        return array_merge($base, $overrides);
     }
 
     /**
