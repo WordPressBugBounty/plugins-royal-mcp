@@ -3,7 +3,7 @@
  * Plugin Name: Royal MCP – Secure AI Connector for Claude, ChatGPT & Gemini
  * Plugin URI: https://royalplugins.com/support/royal-mcp/
  * Description: Integrate Model Context Protocol (MCP) servers with WordPress to enable LLM interactions with your site
- * Version: 1.4.28
+ * Version: 1.4.29
  * Author: Royal Plugins
  * Author URI: https://www.royalplugins.com
  * License: GPL v2 or later
@@ -20,7 +20,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Define plugin constants
-define('ROYAL_MCP_VERSION', '1.4.28');
+define('ROYAL_MCP_VERSION', '1.4.29');
 define('ROYAL_MCP_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('ROYAL_MCP_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('ROYAL_MCP_PLUGIN_FILE', __FILE__);
@@ -189,22 +189,77 @@ class Royal_MCP_Plugin {
      * Runtime schema check. register_activation_hook only fires on activation, so plugins
      * that ship new tables via an update never run create_tables() on existing installs.
      * This heals any install where the DB version doesn't match the plugin version.
+     *
+     * INVARIANT: db_version must only advance when EVERY required migration actually ran.
+     * If class_exists() returns false (autoloader transiently failed during wp.org auto-update,
+     * opcache stale on LiteSpeed, file-deploy race) AND the force-load fallback can't find the
+     * file, we leave db_version alone so the next request retries. Latching db_version on
+     * partial failure caused the 1.4.27 silent-failure regression (see 1.4.29 changelog).
+     *
+     * INVARIANT (added 1.4.29 after @rula99): db_version matching the plugin version is
+     * necessary but NOT sufficient — we also verify required tables physically exist before
+     * short-circuiting. Stuck states like "uninstall dropped tables but left db_version
+     * intact, then reinstall ran" no longer latch the healer into a permanent no-op.
      */
     public function maybe_upgrade_db() {
-        if (get_option('royal_mcp_db_version') === ROYAL_MCP_VERSION) {
+        if (get_option('royal_mcp_db_version') === ROYAL_MCP_VERSION
+            && $this->required_tables_exist()) {
             return;
         }
 
+        $token_store_ok = false;
         if (class_exists('\Royal_MCP\OAuth\Token_Store')) {
             \Royal_MCP\OAuth\Token_Store::create_tables();
+            $token_store_ok = true;
+        } else {
+            $f = ROYAL_MCP_PLUGIN_DIR . 'includes/OAuth/Token_Store.php';
+            if (file_exists($f)) {
+                require_once $f;
+                \Royal_MCP\OAuth\Token_Store::create_tables();
+                $token_store_ok = true;
+            }
         }
 
-        // 1.4.27 — heal sessions table on existing installs that upgrade past 1.4.27.
+        $session_store_ok = false;
         if (class_exists('\Royal_MCP\MCP\Session_Store')) {
             \Royal_MCP\MCP\Session_Store::create_tables();
+            $session_store_ok = true;
+        } else {
+            $f = ROYAL_MCP_PLUGIN_DIR . 'includes/MCP/Session_Store.php';
+            if (file_exists($f)) {
+                require_once $f;
+                \Royal_MCP\MCP\Session_Store::create_tables();
+                $session_store_ok = true;
+            }
         }
 
-        update_option('royal_mcp_db_version', ROYAL_MCP_VERSION);
+        if ($token_store_ok && $session_store_ok) {
+            update_option('royal_mcp_db_version', ROYAL_MCP_VERSION);
+        }
+        // If either failed: db_version stays at the old value, next request retries.
+    }
+
+    /**
+     * Verify the two core tables required for OAuth client registration and MCP session
+     * persistence physically exist. Used by maybe_upgrade_db() as a backstop against the
+     * db_version option lying (see @rula99's wp.org forum report, 1.4.29 changelog).
+     *
+     * Two SHOW TABLES LIKE queries per pageload — negligible cost, and the safe-by-default
+     * payoff is that no external or accidental state mismatch can latch the healer.
+     */
+    private function required_tables_exist() {
+        global $wpdb;
+        $required = [
+            $wpdb->prefix . 'royal_mcp_oauth_clients',
+            $wpdb->prefix . 'royal_mcp_sessions',
+        ];
+        foreach ($required as $table) {
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Schema probe, no caching layer involved.
+            if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $table)) !== $table) {
+                return false;
+            }
+        }
+        return true;
     }
 
     public function deactivate() {
