@@ -4,7 +4,7 @@ Donate link: https://www.royalplugins.com
 Tags: mcp, ai, claude, chatgpt, elementor
 Requires at least: 5.8
 Tested up to: 7.0
-Stable tag: 1.4.36
+Stable tag: 1.4.37
 Requires PHP: 7.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -324,6 +324,18 @@ Every authenticated MCP request is logged to the Royal MCP activity log with tim
 
 == Changelog ==
 
+= 1.4.37 =
+* Feature: Six new Royal AI Firewall tools return dashboard stats, recent bot hits, per-bot policies, policy updates, daily rollups, and a block-all-AI-bots action.
+* Feature: New Royal Tools admin page lists every free Royal Plugins family member with one-click install links.
+* Feature: New `royal_mcp_connection_health` diagnostic tool returns route, auth method, session ID, and version details for any authenticated caller.
+* Feature: New `elementor_get_widget_settings` tool reads full settings for a single Elementor widget, container, section, or column by ID.
+* Feature: Coexistence detection surfaces a routing hint on Elementor tool descriptions when Elementor's own MCP module is also active.
+* Feature: Custom top header bar renders on every Royal MCP admin page with View Docs and Support buttons.
+* Enhancement: Lightweight admin footer shows Royal Plugins family links plus the current plugin version marker.
+* Enhancement: `wp_update_post` and `wp_update_page` now accept `menu_order`, `post_parent`, `password`, `comment_status`, `ping_status`, `excerpt`, and `post_author` fields and return actual stored values so silent-drop by WordPress is surfaced rather than hidden.
+* Enhancement: New `royal_mcp_tool_context` hook fires alongside the legacy `royal_mcp_tool_called` action with an enriched payload for downstream firewall integrations.
+* Fix: `wp_get_seo_meta` now correctly reports noindex state on Rank Math sites, and `wp_update_seo_meta` responses reflect actual stored values rather than requested values.
+
 = 1.4.36 =
 * Feature: New `wp_get_site_status` tool returns WordPress, PHP, MySQL, plugin, theme, and environment info in a single call.
 * Feature: New `wp_get_error_log_tail` tool returns the last lines of the debug log with optional keyword filtering.
@@ -525,6 +537,9 @@ Every authenticated MCP request is logged to the Royal MCP activity log with tim
 * Initial release.
 
 == Upgrade Notice ==
+
+= 1.4.37 =
+Adds six Royal AI Firewall tools, a Royal Tools admin page with one-click install links to the free Royal Plugins family, a connection-health diagnostic tool, an Elementor widget-settings read tool, and expands wp_update_post / wp_update_page with menu_order and other missing fields plus real read-after-write response shape.
 
 = 1.4.36 =
 Adds three diagnostic tools (site status, error-log tail, cron schedule), preserves HTML across several write tools, and adds admin notices for two common environment issues that block OAuth discovery.

@@ -92,11 +92,11 @@ class Token_Store {
             UNIQUE KEY client_id (client_id)
         ) $charset_collate;" );
 
-        // Authorization codes — added 1.4.17. Moved off transients because object
-        // cache backends on some host stacks (LiteSpeed + SpeedyCache, confirmed)
-        // silently evict the transient key between /authorize and /token, breaking
-        // the OAuth handshake. Direct DB storage with sha256-hashed lookup gives
-        // us reliable consume semantics regardless of cache backend.
+        // Authorization codes in a dedicated table (not transients). Object-
+        // cache drop-ins on some host stacks silently evict transient keys
+        // between /authorize and /token, breaking the OAuth handshake. Direct
+        // DB storage with sha256-hashed lookup gives reliable consume semantics
+        // regardless of which cache backend is active.
         dbDelta( "CREATE TABLE IF NOT EXISTS $auth_codes_table (
             id bigint(20) NOT NULL AUTO_INCREMENT,
             code_hash varchar(64) NOT NULL,
@@ -132,7 +132,7 @@ class Token_Store {
     }
 
     /* ------------------------------------------------------------------
-     *  Authorization codes  (DB-backed since 1.4.17 — see create_tables comment)
+     *  Authorization codes  (DB-backed — see create_tables comment)
      * ----------------------------------------------------------------*/
 
     /**
@@ -356,13 +356,12 @@ class Token_Store {
         $clients    = (int) $wpdb->query( "DELETE FROM `{$clients_table}`" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
         $auth_codes = (int) $wpdb->query( "DELETE FROM `{$auth_codes_table}`" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
-        // Belt-and-suspenders: clear any legacy transients from <1.4.17 installs that upgraded mid-flow. New auth codes since 1.4.17 are DB-backed, but a pre-upgrade in-flight transient could still exist on the first run.
+        // Belt-and-suspenders: clear any legacy in-flight authcode transients from earlier storage backends.
         $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_royal_mcp_authcode_%' OR option_name LIKE '_transient_timeout_royal_mcp_authcode_%'" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 
         // Also clear any manually-configured static OAuth client_id / client_secret so the
         // connector falls back to Dynamic Client Registration on the next handshake.
-        // Pre-1.4.22 these settings were not part of the reset, leaving customers unable to
-        // toggle back from manual-creds mode to DCR through the UI.
+        // Without this clear, an admin in manual-creds mode has no UI path back to DCR.
         $static_creds_cleared = 0;
         $settings             = get_option( 'royal_mcp_settings', [] );
         if ( is_array( $settings ) && ( ! empty( $settings['oauth_client_id'] ) || ! empty( $settings['oauth_client_secret'] ) ) ) {
