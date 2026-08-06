@@ -503,6 +503,99 @@ class Server {
         return $response;
     }
 
+
+    /**
+     * Shared implementation for wp_replace_in_post / wp_replace_in_page.
+     *
+     * Literal (case-sensitive) find/replace on post_content, so callers can
+     * make surgical edits to large documents without re-transmitting the
+     * full body through the MCP transport. All occurrences are replaced in
+     * one call (str_replace semantics).
+     *
+     * Safety rails, in evaluation order:
+     *   - find must be non-empty; replace must be present (may be "").
+     *   - expected_count, when provided, aborts BEFORE writing unless the
+     *     occurrence count matches exactly — protects against a stale
+     *     mental model of the content (e.g. the post changed since the
+     *     caller last read it).
+     *   - dry_run reports the count and writes nothing.
+     *   - zero occurrences is an error, not a silent no-op, so LLM callers
+     *     cannot mistake a typo'd needle for success.
+     *
+     * The response is read-after-write in the same spirit as
+     * build_update_response(): stored content is re-read and compared to
+     * the computed replacement; a mismatch (kses stripping for callers
+     * without unfiltered_html, content filters, etc.) is surfaced via
+     * modified_by_wp rather than hidden behind a success message.
+     *
+     * @param int    $post_id Target post ID (existence checked by caller).
+     * @param array  $args    Raw tool args (find, replace, expected_count, dry_run).
+     * @param string $noun    'post' or 'page' — only used in messages.
+     *
+     * @return array Response with id, occurrences, replaced, verified, lengths, message.
+     */
+    private static function replace_in_post_content(int $post_id, array $args, string $noun): array {
+        // object-level edit_post resolves to the PT-specific cap
+        // (edit_page etc.) automatically via map_meta_cap — same gate as
+        // wp_update_post / wp_update_page.
+        if (!current_user_can('edit_post', $post_id)) {
+            throw new \Exception('You do not have permission to edit this ' . esc_html($noun) . '.');
+        }
+        if (!isset($args['find']) || !is_string($args['find']) || $args['find'] === '') {
+            throw new \Exception('find must be a non-empty string.');
+        }
+        if (!array_key_exists('replace', $args) || !is_string($args['replace'])) {
+            throw new \Exception('replace must be a string (empty string deletes the matched text).');
+        }
+        $find = $args['find'];
+        $replace = $args['replace'];
+        // Raw stored content, NOT filtered output — replacement operates on
+        // exactly what wp_update_post would receive back.
+        $content = (string) get_post($post_id)->post_content;
+        $occurrences = substr_count($content, $find);
+        if (array_key_exists('expected_count', $args) && intval($args['expected_count']) !== $occurrences) {
+            throw new \Exception(sprintf('expected_count is %d but %d occurrence(s) found; content unchanged.', intval($args['expected_count']), $occurrences));
+        }
+        if (!empty($args['dry_run'])) {
+            return [
+                'id' => $post_id,
+                'dry_run' => true,
+                'occurrences' => $occurrences,
+                'content_length' => strlen($content),
+                'message' => sprintf('Dry run: %d occurrence(s) found; nothing written.', $occurrences),
+            ];
+        }
+        if ($occurrences === 0) {
+            throw new \Exception('find string not found in ' . esc_html($noun) . ' content; nothing to replace. Use dry_run=true to probe safely.');
+        }
+        if ($find === $replace) {
+            throw new \Exception('find and replace are identical; nothing to do.');
+        }
+        $new_content = str_replace($find, $replace, $content);
+        // See wp_create_post for the wp_slash + no-wp_kses_post rationale;
+        // kses still applies inside wp_update_post for callers without
+        // unfiltered_html, which the verification below surfaces.
+        $result = wp_update_post(['ID' => $post_id, 'post_content' => wp_slash($new_content)], true);
+        if (is_wp_error($result)) throw new \Exception(esc_html($result->get_error_message()));
+        $stored = (string) get_post($post_id)->post_content;
+        $verified = ($stored === $new_content);
+        $response = [
+            'id' => $post_id,
+            'occurrences' => $occurrences,
+            'replaced' => $occurrences,
+            'verified' => $verified,
+            'content_length_before' => strlen($content),
+            'content_length_after' => strlen($stored),
+            'message' => sprintf('%s content updated: %d occurrence(s) replaced.', ucfirst($noun), $occurrences),
+        ];
+        if (!$verified) {
+            $response['modified_by_wp'] = [
+                'content' => 'Stored content differs from the computed replacement (sanitization or a content filter modified it on save). Re-read the ' . $noun . ' to inspect the stored result.',
+            ];
+        }
+        return $response;
+    }
+
     /**
      * Sanitize a meta value received from an MCP client.
      *
@@ -585,6 +678,7 @@ class Server {
             ['name' => 'wp_get_post', 'description' => 'Get single post by ID (any post type)', 'inputSchema' => ['type' => 'object', 'properties' => ['id' => ['type' => 'integer', 'description' => 'Post ID']], 'required' => ['id']]],
             ['name' => 'wp_create_post', 'description' => 'Create new post (supports custom post types). Combine status="future" with date to schedule. Excerpt may contain safe HTML (same allow-list as post content).', 'inputSchema' => ['type' => 'object', 'properties' => ['title' => ['type' => 'string'], 'content' => ['type' => 'string'], 'status' => ['type' => 'string', 'enum' => ['publish', 'draft', 'future', 'pending', 'private']], 'date' => ['type' => 'string', 'description' => 'ISO 8601 datetime in the site timezone (e.g. 2026-12-25T09:00:00). Combine with status=future to schedule. Past dates auto-publish with that timestamp.'], 'excerpt' => ['type' => 'string', 'description' => 'Optional excerpt. May contain safe HTML (same allow-list as post content).'], 'categories' => ['type' => 'array', 'items' => ['type' => 'integer']], 'post_type' => ['type' => 'string', 'description' => 'Post type slug (default: post)'], 'featured_media' => ['type' => 'integer', 'description' => 'Attachment ID to set as featured image'], 'post_author' => ['type' => 'integer', 'description' => 'User ID to assign as the post author. Defaults to the authenticated MCP user (admin). Use wp_get_users to discover available author IDs.']], 'required' => ['title', 'content']]],
             ['name' => 'wp_update_post', 'description' => 'Update existing post (any post type). Response includes saved_fields (actual stored values, read back from DB) so silent-drop / silent-modify by WordPress is surfaced rather than hidden. Pass date to reschedule or backdate.', 'inputSchema' => ['type' => 'object', 'properties' => ['id' => ['type' => 'integer'], 'title' => ['type' => 'string'], 'content' => ['type' => 'string'], 'status' => ['type' => 'string'], 'date' => ['type' => 'string', 'description' => 'ISO 8601 datetime in the site timezone (e.g. 2026-12-25T09:00:00). Combine with status=future to reschedule, or use alone to backdate.'], 'excerpt' => ['type' => 'string', 'description' => 'Optional excerpt. May contain safe HTML (same allow-list as post content).'], 'featured_media' => ['type' => 'integer', 'description' => 'Attachment ID to set as featured image (pass 0 to remove)'], 'post_author' => ['type' => 'integer', 'description' => 'User ID to reassign as the post author. Use wp_get_users to discover available author IDs.'], 'menu_order' => ['type' => 'integer', 'description' => 'Order among sibling posts/pages. Lower = earlier.'], 'post_parent' => ['type' => 'integer', 'description' => 'Parent post ID (0 = no parent). Useful for hierarchical CPTs. Throws if the ID does not exist.'], 'password' => ['type' => 'string', 'description' => 'Post password. Empty string removes protection.'], 'comment_status' => ['type' => 'string', 'enum' => ['open', 'closed'], 'description' => 'Allow (open) or disallow (closed) new comments.'], 'ping_status' => ['type' => 'string', 'enum' => ['open', 'closed'], 'description' => 'Allow (open) or disallow (closed) trackbacks / pingbacks.']], 'required' => ['id']]],
+            ['name' => 'wp_replace_in_post', 'description' => 'Find/replace a literal string inside a post\'s content (any post type) without resending the full body. Use for surgical edits to large posts (page-builder content, embedded base64 payloads) where wp_update_post\'s full-content replacement is impractical. Case-sensitive literal match, no regex. All occurrences are replaced. Response includes occurrence count and read-after-write verification. Set dry_run=true to preview the match count without writing; set expected_count to abort unless exactly that many matches exist.', 'inputSchema' => ['type' => 'object', 'properties' => ['id' => ['type' => 'integer'], 'find' => ['type' => 'string', 'minLength' => 1, 'description' => 'Literal text to find in post_content (case-sensitive, no regex).'], 'replace' => ['type' => 'string', 'description' => 'Literal replacement text. Empty string deletes the matched text.'], 'expected_count' => ['type' => 'integer', 'description' => 'Optional guard: abort without writing unless the number of occurrences equals this value.'], 'dry_run' => ['type' => 'boolean', 'description' => 'Report the occurrence count without writing. Default false.']], 'required' => ['id', 'find', 'replace']]],
             ['name' => 'wp_get_post_types', 'description' => 'Get all registered public post types (including custom post types)', 'inputSchema' => ['type' => 'object', 'properties' => new \stdClass()]],
             ['name' => 'wp_delete_post', 'description' => 'Delete post', 'inputSchema' => ['type' => 'object', 'properties' => ['id' => ['type' => 'integer'], 'force' => ['type' => 'boolean', 'description' => 'Skip trash and permanently delete']], 'required' => ['id']]],
             ['name' => 'wp_count_posts', 'description' => 'Get post counts by status', 'inputSchema' => ['type' => 'object', 'properties' => ['post_type' => ['type' => 'string', 'description' => 'Post type (post, page, etc)']]]],
@@ -594,6 +688,7 @@ class Server {
             ['name' => 'wp_get_page', 'description' => 'Get single page by ID', 'inputSchema' => ['type' => 'object', 'properties' => ['id' => ['type' => 'integer', 'description' => 'Page ID']], 'required' => ['id']]],
             ['name' => 'wp_create_page', 'description' => 'Create new page. Combine status="future" with date to schedule. Excerpt (via wp_update_post_meta on _excerpt or via wp_create_post fallback) may contain safe HTML.', 'inputSchema' => ['type' => 'object', 'properties' => ['title' => ['type' => 'string'], 'content' => ['type' => 'string'], 'status' => ['type' => 'string', 'enum' => ['publish', 'draft', 'future', 'pending', 'private']], 'date' => ['type' => 'string', 'description' => 'ISO 8601 datetime in the site timezone (e.g. 2026-12-25T09:00:00). Combine with status=future to schedule.'], 'parent' => ['type' => 'integer', 'description' => 'Parent page ID']], 'required' => ['title', 'content']]],
             ['name' => 'wp_update_page', 'description' => 'Update existing page. Response includes saved_fields (actual stored values, read back from DB) so silent-drop / silent-modify by WordPress is surfaced rather than hidden. Pass date to reschedule or backdate.', 'inputSchema' => ['type' => 'object', 'properties' => ['id' => ['type' => 'integer'], 'title' => ['type' => 'string'], 'content' => ['type' => 'string'], 'status' => ['type' => 'string'], 'date' => ['type' => 'string', 'description' => 'ISO 8601 datetime in the site timezone (e.g. 2026-12-25T09:00:00). Combine with status=future to reschedule, or use alone to backdate.'], 'excerpt' => ['type' => 'string', 'description' => 'Optional page excerpt. May contain safe HTML.'], 'post_author' => ['type' => 'integer', 'description' => 'User ID to reassign as page author.'], 'menu_order' => ['type' => 'integer', 'description' => 'Order among sibling pages. Lower = earlier in navigation.'], 'post_parent' => ['type' => 'integer', 'description' => 'Parent page ID (0 = top-level). Throws if the ID does not exist.'], 'password' => ['type' => 'string', 'description' => 'Page password. Empty string removes protection.']], 'required' => ['id']]],
+            ['name' => 'wp_replace_in_page', 'description' => 'Find/replace a literal string inside a page\'s content without resending the full body. Page-typed variant of wp_replace_in_post — same semantics: case-sensitive literal match, all occurrences replaced, dry_run preview, expected_count guard, read-after-write verification.', 'inputSchema' => ['type' => 'object', 'properties' => ['id' => ['type' => 'integer'], 'find' => ['type' => 'string', 'minLength' => 1, 'description' => 'Literal text to find in the page content (case-sensitive, no regex).'], 'replace' => ['type' => 'string', 'description' => 'Literal replacement text. Empty string deletes the matched text.'], 'expected_count' => ['type' => 'integer', 'description' => 'Optional guard: abort without writing unless the number of occurrences equals this value.'], 'dry_run' => ['type' => 'boolean', 'description' => 'Report the occurrence count without writing. Default false.']], 'required' => ['id', 'find', 'replace']]],
             ['name' => 'wp_delete_page', 'description' => 'Delete page', 'inputSchema' => ['type' => 'object', 'properties' => ['id' => ['type' => 'integer'], 'force' => ['type' => 'boolean']], 'required' => ['id']]],
 
             // Media
@@ -647,6 +742,7 @@ class Server {
             ['name' => 'wp_get_error_log_tail', 'description' => 'Read the tail of wp-content/debug.log. Returns the last N lines (default 100, max 1000), optionally filtered by a case-insensitive substring. Automatically caps file read at last 1MB to prevent memory blowup on huge logs (truncated=true when this happens). Returns status="disabled" with instructions when WP_DEBUG_LOG is not enabled in wp-config.php. Requires manage_options.', 'inputSchema' => ['type' => 'object', 'properties' => ['lines' => ['type' => 'integer', 'description' => 'Number of lines to return from the tail (default 100, max 1000).'], 'filter' => ['type' => 'string', 'description' => 'Optional case-insensitive substring filter applied before the last-N slice (e.g. "Fatal error", "Deprecated", a plugin slug).']]]],
             ['name' => 'wp_get_cron_schedule', 'description' => 'Enumerate scheduled wp_cron events. Returns each event with hook name, next run (unix + ISO 8601), seconds until next run, is_overdue flag, recurrence (hourly / twicedaily / daily / custom + interval in seconds), and args. Sorted by next-run ascending so overdue events come first. Useful for diagnosing missed schedules, plugin cron conflicts, or unfired hooks. Requires manage_options.', 'inputSchema' => ['type' => 'object', 'properties' => new \stdClass()]],
             ['name' => 'royal_mcp_connection_health', 'description' => 'Diagnostic probe for the current MCP connection. Returns MCP endpoint route, authentication method used by this request (api-key or oauth-bearer), OAuth access token time-to-live in seconds (null for api-key), current MCP session ID, active MCP capabilities negotiated at initialize, plus Royal MCP + WordPress + PHP version strings. No arguments. Call at connection start to confirm setup, or when diagnosing 401/403/404 issues. Any authenticated caller.', 'inputSchema' => ['type' => 'object', 'properties' => new \stdClass()]],
+            ['name' => 'mcp_undo_last_operation', 'description' => 'NARROW SCOPE: reverses ONE tool only — wp_reorder_menu_items. No other tool emits undo tokens (wp_update_post, wp_update_option, wp_update_widget, wp_update_seo_meta, elementor_*, wc_create_order, wc_update_order, wc_add_order_note, etc. all write without undo). Pass the token from a wp_reorder_menu_items response\'s undo.token field. Tokens live 72 hours and are one-shot (consumed on successful undo). More tools gain undo retrofits in future releases. Cap requirement matches the original operation. Free basic mode — single-op restore, local storage.', 'inputSchema' => ['type' => 'object', 'properties' => ['token' => ['type' => 'string', 'description' => 'The undo token from a prior tool response (response.undo.token).']], 'required' => ['token']]],
             ['name' => 'wp_search', 'description' => 'Search all content. Pass snippet>0 to receive a content excerpt around each match (saves tokens vs. fetching each result with wp_get_page).', 'inputSchema' => ['type' => 'object', 'properties' => ['query' => ['type' => 'string'], 'post_type' => ['type' => 'string'], 'per_page' => ['type' => 'integer', 'description' => 'Number of results (default 20, max 100)'], 'snippet' => ['type' => 'integer', 'description' => 'Snippet length in characters around the matched term (default 0 = off, recommended 160-240). When set, results include slug and snippet fields.']], 'required' => ['query']]],
 
             // Options
@@ -660,7 +756,7 @@ class Server {
             ['name' => 'wp_create_menu_item', 'description' => 'Create a menu item in a navigation menu. Requires edit_theme_options capability.', 'inputSchema' => ['type' => 'object', 'properties' => ['menu_id' => ['type' => 'integer'], 'title' => ['type' => 'string'], 'url' => ['type' => 'string', 'description' => 'External URL (leave empty if linking to a post/page via object_id)'], 'object_id' => ['type' => 'integer', 'description' => 'WordPress object ID (post, page, or term)'], 'object_type' => ['type' => 'string', 'enum' => ['post', 'page', 'category', 'custom'], 'description' => 'Type of object being linked (default: custom)'], 'parent_id' => ['type' => 'integer', 'description' => 'Parent menu item ID for nested items (0 = top level)'], 'position' => ['type' => 'integer', 'description' => 'Position in menu order (default: end)'], 'target' => ['type' => 'string', 'enum' => ['_self', '_blank'], 'description' => 'Link target']], 'required' => ['menu_id', 'title']]],
             ['name' => 'wp_update_menu_item', 'description' => 'Update an existing menu item. Only the fields you pass will change; unspecified fields are preserved from the existing item. The tool will refuse explicit-empty values for title or url that would destroy a non-empty existing value — to intentionally clear those, use wp_delete_menu_item then wp_create_menu_item. Requires edit_theme_options capability.', 'inputSchema' => ['type' => 'object', 'properties' => ['menu_item_id' => ['type' => 'integer'], 'title' => ['type' => 'string'], 'url' => ['type' => 'string'], 'parent_id' => ['type' => 'integer'], 'position' => ['type' => 'integer'], 'target' => ['type' => 'string', 'enum' => ['_self', '_blank']]], 'required' => ['menu_item_id']]],
             ['name' => 'wp_delete_menu_item', 'description' => 'Delete a menu item. Requires edit_theme_options capability.', 'inputSchema' => ['type' => 'object', 'properties' => ['menu_item_id' => ['type' => 'integer']], 'required' => ['menu_item_id']]],
-            ['name' => 'wp_reorder_menu_items', 'description' => 'Reorder menu items by passing an array of menu_item_ids in the desired order. Existing titles, URLs, parents, and other fields are preserved on every item touched. If the response includes a "skipped" array, those items could not be safely reordered (e.g. missing or recently deleted) — the rest were reordered correctly. Safe recovery procedure if a menu ever ends up in an unexpected state: wp_delete_menu_item each item, then wp_create_menu_item with both parent_id and position specified in every call. Requires edit_theme_options capability.', 'inputSchema' => ['type' => 'object', 'properties' => ['menu_id' => ['type' => 'integer'], 'item_order' => ['type' => 'array', 'items' => ['type' => 'integer'], 'description' => 'Array of menu_item_ids in the desired order']], 'required' => ['menu_id', 'item_order']]],
+            ['name' => 'wp_reorder_menu_items', 'description' => 'Reorder menu items by passing an array of menu_item_ids in the desired order. Existing titles, URLs, parents, and other fields are preserved on every item touched. Every response includes an "undo" envelope with a token that mcp_undo_last_operation can consume for 72 hours to restore the pre-op menu order. If the response includes a "skipped" array, those items could not be safely reordered (e.g. missing or recently deleted) — the rest were reordered correctly. Requires edit_theme_options capability.', 'inputSchema' => ['type' => 'object', 'properties' => ['menu_id' => ['type' => 'integer'], 'item_order' => ['type' => 'array', 'items' => ['type' => 'integer'], 'description' => 'Array of menu_item_ids in the desired order']], 'required' => ['menu_id', 'item_order']]],
 
             // Plugins & Themes
             ['name' => 'wp_get_plugins', 'description' => 'List all installed plugins. Returns plugin file path, name, version, description, author, and active status for each. Useful for diagnosing plugin conflicts and building a compatibility picture at the start of a debugging conversation.', 'inputSchema' => ['type' => 'object', 'properties' => new \stdClass()]],
@@ -672,10 +768,14 @@ class Server {
             ['name' => 'wp_update_theme_mod', 'description' => 'Update a single theme customizer setting. Requires the "Allow AI to modify theme appearance" admin toggle AND the mod name must be in the allowlist (extend via the royal_mcp_writable_theme_mods filter).', 'inputSchema' => ['type' => 'object', 'properties' => ['mod_name' => ['type' => 'string'], 'value' => ['description' => 'New value (any JSON type compatible with set_theme_mod)']], 'required' => ['mod_name', 'value']]],
             ['name' => 'wp_get_custom_css', 'description' => 'Get the active theme\'s custom CSS', 'inputSchema' => ['type' => 'object', 'properties' => ['theme_slug' => ['type' => 'string', 'description' => 'Theme slug (defaults to active theme)']]]],
             ['name' => 'wp_update_custom_css', 'description' => 'Update the active theme\'s custom CSS. CSS is filtered through wp_kses (script tags stripped). Requires the "Allow AI to modify theme appearance" admin toggle and unfiltered_html capability.', 'inputSchema' => ['type' => 'object', 'properties' => ['css' => ['type' => 'string'], 'theme_slug' => ['type' => 'string', 'description' => 'Theme slug (defaults to active theme)']], 'required' => ['css']]],
+            ['name' => 'wp_get_widgets', 'description' => 'List widget instances. Uses the WordPress core /wp/v2/widgets REST endpoint so classic and block widgets are returned uniformly. Omit sidebar to return widgets across ALL sidebars including wp_inactive_widgets (orphaned widgets from prior themes — these have rendered:"" and produce no front-end output). Filter by a specific sidebar ID (discover IDs via wp_get_sidebars) to scope results; a non-existent sidebar ID returns an empty array, not an error.', 'inputSchema' => ['type' => 'object', 'properties' => ['sidebar' => ['type' => 'string', 'description' => 'Optional sidebar ID to filter by. Omit to return widgets across all sidebars (includes wp_inactive_widgets).']]]],
+            ['name' => 'wp_get_sidebars', 'description' => 'List registered sidebars (widget areas) on the active theme with their IDs, names, description, and status. Use to discover sidebar IDs before calling wp_get_widgets or wp_update_widget.', 'inputSchema' => ['type' => 'object', 'properties' => new \stdClass()]],
+            ['name' => 'wp_update_widget', 'description' => 'Update a widget instance by ID. Requires the "Allow AI to modify theme appearance" admin toggle AND edit_theme_options capability. Uses WordPress core /wp/v2/widgets so classic and block widgets are handled uniformly. Pass the id returned by wp_get_widgets.', 'inputSchema' => ['type' => 'object', 'properties' => ['id' => ['type' => 'string', 'description' => 'Widget ID (e.g. text-2, block-15)'], 'sidebar' => ['type' => 'string', 'description' => 'Sidebar ID to place the widget in (omit to leave unchanged)'], 'instance' => ['type' => 'object', 'description' => 'Widget instance data. For classic widgets, either pass the same {encoded, hash} object returned by wp_get_widgets or wrap raw settings as {raw: {…}}.'], 'form_data' => ['type' => 'string', 'description' => 'Serialized form data (classic widgets alternative to instance)']], 'required' => ['id']]],
 
             // SEO Meta (auto-detects Yoast SEO or Rank Math)
             ['name' => 'wp_get_seo_meta', 'description' => 'Get the SEO meta fields for a post (title, description, focus keyword, robots, OG/Twitter overrides, URL slug). Auto-detects Yoast SEO or Rank Math — returns the active plugin\'s fields plus the post slug (which is a WordPress-native field, returned regardless of SEO plugin).', 'inputSchema' => ['type' => 'object', 'properties' => ['post_id' => ['type' => 'integer']], 'required' => ['post_id']]],
             ['name' => 'wp_update_seo_meta', 'description' => 'Update SEO meta fields on a post. Auto-routes title/description/focus_keyword/noindex/og_* to Yoast or Rank Math based on which is active. The slug field is a WordPress-native field and works regardless of SEO plugin (corresponds to the URL slug shown in Yoast\'s and Rank Math\'s UI editors). Requires edit_post capability on the target post.', 'inputSchema' => ['type' => 'object', 'properties' => ['post_id' => ['type' => 'integer'], 'title' => ['type' => 'string', 'description' => 'SEO title (replaces the meta title used in browser tabs and SERPs)'], 'description' => ['type' => 'string', 'description' => 'SEO meta description (used in SERPs)'], 'focus_keyword' => ['type' => 'string', 'description' => 'Primary focus keyword for SEO scoring'], 'noindex' => ['type' => 'boolean', 'description' => 'Tell search engines not to index this URL'], 'og_title' => ['type' => 'string', 'description' => 'Open Graph title (Facebook / Slack / LinkedIn previews)'], 'og_description' => ['type' => 'string', 'description' => 'Open Graph description'], 'slug' => ['type' => 'string', 'description' => 'URL slug (post_name). WordPress will sanitize and ensure uniqueness; the actually-saved value is returned in the response so the caller can confirm.']], 'required' => ['post_id']]],
+            ['name' => 'seo_audit_meta_tags', 'description' => 'Fetch a post\'s actual rendered HTML and parse the head for title, meta description, canonical, viewport, Open Graph and Twitter Card tags. Catches theme/plugin/cache conflicts that only appear in the served output — duplicate title tags, mismatched canonicals, missing OG images, viewport misconfiguration. Complements wp_get_seo_meta (which reads DB fields) by validating what actually reaches crawlers. Pass a post_id (URL is resolved via get_permalink) or a same-site url. Read-only.', 'inputSchema' => ['type' => 'object', 'properties' => ['post_id' => ['type' => 'integer', 'description' => 'Post ID whose permalink to audit. Either post_id or url is required.'], 'url' => ['type' => 'string', 'description' => 'Absolute URL to audit. Must be on this site (same host as home_url). Either post_id or url is required.']]]],
 
             // Permalink Structure
             ['name' => 'wp_get_permalink_structure', 'description' => 'Get the WordPress permalink structure (e.g. /%postname%/, /%year%/%monthnum%/%postname%/). Read-only.', 'inputSchema' => ['type' => 'object', 'properties' => new \stdClass()]],
@@ -704,7 +804,13 @@ class Server {
         // to our tools; opt-in defer only.
         $tools = Elementor_Coexistence::filter_elementor_tool_descriptions( $tools );
 
-        return $tools;
+        /**
+         * Filter the full tool list returned to tools/list. Applied last so
+         * profile trims + custom filters see every registered tool.
+         *
+         * @param array $tools Tool definitions with name, description, inputSchema.
+         */
+        return apply_filters( 'royal_mcp_tools', $tools );
     }
 
     /**
@@ -1342,10 +1448,15 @@ class Server {
 
         static $destructive_exact = [
             'wp_reorder_menu_items',
+            'mcp_undo_last_operation',
             'wp_restore_revision',
             'wp_update_permalink_structure',
             'wp_update_custom_css',
+            'wp_update_widget',
             'wp_update_option',
+            'wc_create_order',
+            'wc_update_order',
+            'wc_add_order_note',
             'raif_set_bot_policy',
             'raif_block_all_ai_bots',
             'fc_clear_cache',
@@ -1618,6 +1729,11 @@ class Server {
                 }
                 return self::build_update_response($post_id, $args, $data, 'Post updated successfully');
 
+            case 'wp_replace_in_post':
+                $post_id = self::resolve_post_id_arg($args);
+                if ($post_id <= 0 || !get_post($post_id)) throw new \Exception('Post not found.');
+                return self::replace_in_post_content($post_id, $args, 'post');
+
             case 'wp_delete_post':
                 $post_id = self::resolve_post_id_arg($args);
                 if ($post_id <= 0) throw new \Exception('Post not found.');
@@ -1793,6 +1909,12 @@ class Server {
                 $result = wp_update_post($data);
                 if (is_wp_error($result)) throw new \Exception(esc_html($result->get_error_message()));
                 return self::build_update_response($page_id, $args, $data, 'Page updated successfully');
+
+            case 'wp_replace_in_page':
+                $page_id = self::resolve_post_id_arg($args);
+                $existing_page = $page_id > 0 ? get_post($page_id) : null;
+                if (!$existing_page || $existing_page->post_type !== 'page') throw new \Exception('Page not found.');
+                return self::replace_in_post_content($page_id, $args, 'page');
 
             case 'wp_delete_page':
                 $page_id = self::resolve_post_id_arg($args);
@@ -2827,11 +2949,26 @@ class Server {
                     throw new \Exception('edit_theme_options capability required.');
                 }
                 $menu_id = intval($args['menu_id']);
-                if (!wp_get_nav_menu_object($menu_id)) {
+                $menu_obj = wp_get_nav_menu_object($menu_id);
+                if (!$menu_obj) {
                     throw new \Exception('Menu not found.');
                 }
                 $order = $args['item_order'] ?? [];
                 if (!is_array($order)) throw new \Exception('item_order must be an array of menu_item_ids.');
+
+                // Snapshot the pre-op state of every item in this menu BEFORE any
+                // mutation. Captures menu_order + menu_item_parent per item so a
+                // full restore is possible even when the caller reorders only a
+                // subset. Stored in wp_options via Undo_Store, TTL 72h.
+                $pre_op_items = wp_get_nav_menu_items($menu_id) ?: [];
+                $pre_op_state = [];
+                foreach ($pre_op_items as $item) {
+                    $pre_op_state[(int) $item->db_id] = [
+                        'menu_order'       => (int) $item->menu_order,
+                        'menu_item_parent' => (int) $item->menu_item_parent,
+                    ];
+                }
+
                 // For each item, read existing values then send a full args
                 // payload with only menu-item-position overridden. Sending
                 // partial args here was the 1.4.17 destructive bug — WP merges
@@ -2859,11 +2996,223 @@ class Server {
                     $reordered[] = $iid;
                     $position++;
                 }
+
+                // Persist the snapshot and build the undo envelope.
+                $undo_envelope = \Royal_MCP\MCP\Undo_Store::store([
+                    'op'      => 'wp_reorder_menu_items',
+                    'summary' => sprintf('Restore menu "%s" (%d items) to prior order', $menu_obj->name, count($pre_op_state)),
+                    'target'  => ['menu_id' => $menu_id, 'menu_name' => $menu_obj->name],
+                    'pre_op_state' => $pre_op_state,
+                ]);
+
                 $response = ['success' => true, 'menu_id' => $menu_id, 'count' => count($reordered), 'reordered' => $reordered];
                 if (!empty($skipped)) {
                     $response['skipped'] = $skipped;
                 }
+                $response['undo'] = $undo_envelope;
                 return $response;
+
+            // ==================== SEO — served-HTML audit ====================
+            case 'seo_audit_meta_tags':
+                if (!current_user_can('read')) {
+                    throw new \Exception('read capability required.');
+                }
+                $seo_post_id = isset($args['post_id']) ? (int) $args['post_id'] : 0;
+                $seo_url     = isset($args['url']) ? esc_url_raw((string) $args['url']) : '';
+                if ($seo_post_id <= 0 && $seo_url === '') {
+                    throw new \Exception('Either post_id or url is required.');
+                }
+                if ($seo_post_id > 0) {
+                    if (!get_post($seo_post_id)) {
+                        throw new \Exception('Post not found: ' . esc_html((string) $seo_post_id));
+                    }
+                    $seo_url = get_permalink($seo_post_id);
+                    if (!$seo_url) {
+                        throw new \Exception('Cannot resolve permalink for post ' . esc_html((string) $seo_post_id));
+                    }
+                }
+                // SSRF guard — only allow same-host URLs (this site's own permalinks).
+                // Two-layer defense: (1) hostname must match home_url's host, (2) we IGNORE
+                // caller-supplied port + scheme and rebuild the fetch URL against home_url's
+                // origin. Layer 2 defeats the same-host-different-port SSRF vector (e.g.
+                // caller passing example.com:3306 or example.com:6379 to probe internal
+                // services bound on the same hostname).
+                $seo_parts  = wp_parse_url($seo_url);
+                $home_parts = wp_parse_url(home_url());
+                if (!$seo_parts || empty($seo_parts['host']) || empty($home_parts['host'])) {
+                    throw new \Exception('Invalid URL.');
+                }
+                if (strcasecmp($seo_parts['host'], $home_parts['host']) !== 0) {
+                    throw new \Exception('url must be on this site (same host as home_url). Cross-domain audits are not supported.');
+                }
+                // Rebuild the URL against home_url's origin — caller cannot override port or
+                // scheme, only path/query. This is the port-SSRF fix.
+                $safe_path  = isset($seo_parts['path'])  ? $seo_parts['path']         : '/';
+                $safe_query = isset($seo_parts['query']) ? '?' . $seo_parts['query']  : '';
+                $seo_url    = rtrim(home_url(), '/') . $safe_path . $safe_query;
+                $seo_response = wp_remote_get($seo_url, [
+                    'timeout'     => 10,
+                    'redirection' => 3,
+                    'user-agent'  => 'Royal MCP SEO Audit',
+                    'sslverify'   => true,
+                ]);
+                if (is_wp_error($seo_response)) {
+                    throw new \Exception('Failed to fetch URL: ' . esc_html($seo_response->get_error_message()));
+                }
+                $seo_status = (int) wp_remote_retrieve_response_code($seo_response);
+                $seo_html   = (string) wp_remote_retrieve_body($seo_response);
+                if ($seo_status < 200 || $seo_status >= 300) {
+                    throw new \Exception('Non-2xx HTTP status ' . $seo_status . ' when fetching ' . esc_html($seo_url));
+                }
+                if ($seo_html === '') {
+                    throw new \Exception('Empty response body from ' . esc_html($seo_url));
+                }
+
+                // Parse the head with DOMDocument — regex on HTML is fragile.
+                $prev_libxml = libxml_use_internal_errors(true);
+                $seo_dom     = new \DOMDocument();
+                $seo_dom->loadHTML('<?xml encoding="UTF-8">' . $seo_html);
+                libxml_clear_errors();
+                libxml_use_internal_errors($prev_libxml);
+
+                // Titles
+                $title_nodes  = $seo_dom->getElementsByTagName('title');
+                $title_first  = $title_nodes->length > 0 ? trim($title_nodes->item(0)->textContent) : '';
+
+                // Metas — walk once, bucket by name/property.
+                $meta_desc_values     = [];
+                $viewport_content     = '';
+                $og_fields            = ['title' => '', 'description' => '', 'image' => '', 'url' => '', 'type' => ''];
+                $tw_fields            = ['card' => '', 'title' => '', 'description' => '', 'image' => ''];
+                $meta_nodes           = $seo_dom->getElementsByTagName('meta');
+                foreach ($meta_nodes as $m) {
+                    $name     = strtolower((string) $m->getAttribute('name'));
+                    $property = strtolower((string) $m->getAttribute('property'));
+                    $content  = (string) $m->getAttribute('content');
+                    if ($name === 'description') {
+                        $meta_desc_values[] = $content;
+                    } elseif ($name === 'viewport') {
+                        $viewport_content = $content;
+                    } elseif (str_starts_with($property, 'og:')) {
+                        $og_key = substr($property, 3);
+                        if (array_key_exists($og_key, $og_fields) && $og_fields[$og_key] === '') {
+                            $og_fields[$og_key] = $content;
+                        }
+                    } elseif (str_starts_with($name, 'twitter:')) {
+                        $tw_key = substr($name, 8);
+                        if (array_key_exists($tw_key, $tw_fields) && $tw_fields[$tw_key] === '') {
+                            $tw_fields[$tw_key] = $content;
+                        }
+                    }
+                }
+
+                // Canonicals
+                $canonical_hrefs = [];
+                $link_nodes      = $seo_dom->getElementsByTagName('link');
+                foreach ($link_nodes as $l) {
+                    if (strtolower((string) $l->getAttribute('rel')) === 'canonical') {
+                        $canonical_hrefs[] = (string) $l->getAttribute('href');
+                    }
+                }
+                $canonical_first = $canonical_hrefs[0] ?? '';
+                $canonical_norm  = $canonical_first !== '' ? untrailingslashit($canonical_first) : '';
+                $requested_norm  = untrailingslashit($seo_url);
+
+                return [
+                    'url'    => $seo_url,
+                    'status' => $seo_status,
+                    'title'  => [
+                        'value'      => $title_first,
+                        'length'     => strlen($title_first),
+                        'duplicates' => max(0, $title_nodes->length - 1),
+                    ],
+                    'description' => [
+                        'value'      => $meta_desc_values[0] ?? '',
+                        'length'     => isset($meta_desc_values[0]) ? strlen($meta_desc_values[0]) : 0,
+                        'duplicates' => max(0, count($meta_desc_values) - 1),
+                    ],
+                    'canonical' => [
+                        'value'      => $canonical_first,
+                        'duplicates' => max(0, count($canonical_hrefs) - 1),
+                        'is_self'    => $canonical_norm !== '' && strcasecmp($canonical_norm, $requested_norm) === 0,
+                    ],
+                    'viewport' => [
+                        'present' => $viewport_content !== '',
+                        'content' => $viewport_content,
+                    ],
+                    'og'      => $og_fields,
+                    'twitter' => $tw_fields,
+                ];
+
+            // ==================== UNDO (Free basic mode) ====================
+            case 'mcp_undo_last_operation':
+                $undo_token = isset($args['token']) ? sanitize_text_field((string) $args['token']) : '';
+                if ($undo_token === '') {
+                    throw new \Exception('token is required.');
+                }
+                $undo_snapshot = \Royal_MCP\MCP\Undo_Store::read($undo_token);
+                if (!$undo_snapshot) {
+                    // Single generic message covers all failure modes (malformed,
+                    // unknown, expired, consumed) — see Undo_Store::read security note.
+                    throw new \Exception('Undo token not found, expired, or already consumed.');
+                }
+                $undo_op = $undo_snapshot['op'] ?? '';
+
+                switch ($undo_op) {
+                    case 'wp_reorder_menu_items':
+                        // Cap check matches the original destructive tool.
+                        if (!current_user_can('edit_theme_options')) {
+                            throw new \Exception('edit_theme_options capability required to undo this operation.');
+                        }
+                        $pre_op = isset($undo_snapshot['pre_op_state']) && is_array($undo_snapshot['pre_op_state'])
+                            ? $undo_snapshot['pre_op_state']
+                            : [];
+                        if (empty($pre_op)) {
+                            throw new \Exception('Undo snapshot has no pre_op_state to restore.');
+                        }
+                        $restored_count = 0;
+                        $undo_skipped   = [];
+                        foreach ($pre_op as $item_id => $prior) {
+                            $item_id_int = (int) $item_id;
+                            if ($item_id_int <= 0 || !is_array($prior)) {
+                                $undo_skipped[] = ['menu_item_id' => $item_id_int, 'reason' => 'invalid_snapshot_entry'];
+                                continue;
+                            }
+                            $update_result = wp_update_post([
+                                'ID'          => $item_id_int,
+                                'menu_order'  => (int) ($prior['menu_order'] ?? 0),
+                                'post_parent' => (int) ($prior['menu_item_parent'] ?? 0),
+                            ], true);
+                            if (is_wp_error($update_result)) {
+                                $undo_skipped[] = ['menu_item_id' => $item_id_int, 'reason' => $update_result->get_error_message()];
+                                continue;
+                            }
+                            if ($update_result === 0) {
+                                // Menu item was deleted after the snapshot — nothing to restore for this id.
+                                $undo_skipped[] = ['menu_item_id' => $item_id_int, 'reason' => 'menu_item_not_found'];
+                                continue;
+                            }
+                            $restored_count++;
+                        }
+                        wp_cache_flush();
+                        // One-shot: consume the token so the undo can't be replayed.
+                        \Royal_MCP\MCP\Undo_Store::delete($undo_token);
+
+                        $undo_response = [
+                            'undone'   => true,
+                            'op'       => $undo_op,
+                            'target'   => $undo_snapshot['target'] ?? [],
+                            'restored' => $restored_count,
+                            'summary'  => $undo_snapshot['summary'] ?? '',
+                        ];
+                        if (!empty($undo_skipped)) {
+                            $undo_response['skipped'] = $undo_skipped;
+                        }
+                        return $undo_response;
+
+                    default:
+                        throw new \Exception('Unsupported op in undo snapshot: ' . esc_html((string) $undo_op) . '. This version of Royal MCP does not know how to undo that operation. Contact support if you saw this after a successful tool call.');
+                }
 
             // ==================== PLUGINS & THEMES ====================
             case 'wp_get_plugins':
@@ -2992,6 +3341,55 @@ class Server {
                     'theme_slug' => $theme_slug,
                     'byte_count' => strlen($css),
                 ];
+
+            case 'wp_get_widgets':
+                if (!current_user_can('edit_theme_options')) {
+                    throw new \Exception('edit_theme_options capability required to list widgets.');
+                }
+                $request = new \WP_REST_Request('GET', '/wp/v2/widgets');
+                if (!empty($args['sidebar'])) {
+                    $request->set_param('sidebar', sanitize_key((string) $args['sidebar']));
+                }
+                $response = rest_do_request($request);
+                if ($response->is_error()) {
+                    throw new \Exception(esc_html($response->as_error()->get_error_message()));
+                }
+                return $response->get_data();
+
+            case 'wp_get_sidebars':
+                if (!current_user_can('edit_theme_options')) {
+                    throw new \Exception('edit_theme_options capability required to list sidebars.');
+                }
+                $request = new \WP_REST_Request('GET', '/wp/v2/sidebars');
+                $response = rest_do_request($request);
+                if ($response->is_error()) {
+                    throw new \Exception(esc_html($response->as_error()->get_error_message()));
+                }
+                return $response->get_data();
+
+            case 'wp_update_widget':
+                if (!current_user_can('edit_theme_options')) {
+                    throw new \Exception('edit_theme_options capability required to update widgets.');
+                }
+                $rmcp_settings = get_option('royal_mcp_settings', []);
+                if (empty($rmcp_settings['allow_theme_writes'])) {
+                    throw new \Exception('Theme writes are disabled. Enable "Allow AI to modify theme appearance" under Royal MCP > Settings.');
+                }
+                $widget_id = isset($args['id']) ? sanitize_text_field((string) $args['id']) : '';
+                if ($widget_id === '') {
+                    throw new \Exception('Widget id is required.');
+                }
+                $request = new \WP_REST_Request('PUT', '/wp/v2/widgets/' . $widget_id);
+                foreach (['sidebar', 'instance', 'form_data'] as $param) {
+                    if (isset($args[$param])) {
+                        $request->set_param($param, $args[$param]);
+                    }
+                }
+                $response = rest_do_request($request);
+                if ($response->is_error()) {
+                    throw new \Exception(esc_html($response->as_error()->get_error_message()));
+                }
+                return $response->get_data();
 
             // ==================== SEO META (Yoast / Rank Math auto-detect) ====================
             case 'wp_get_seo_meta':
