@@ -310,6 +310,7 @@ class Core {
 						'url'     => array( 'type' => 'string' ),
 						'slug'    => array( 'type' => 'string' ),
 						'snippet' => array( 'type' => 'string' ),
+						'content_length' => array( 'type' => 'integer' ),
 					),
 				),
 			),
@@ -508,6 +509,8 @@ class Core {
 					),
 				),
 			),
+			'wp_get_revision_content' => self::revision_content_response_schema(),
+			'wp_diff_revisions'       => self::revision_diff_response_schema(),
 			'wp_restore_revision' => array(
 				'type'       => 'object',
 				'properties' => array(
@@ -528,6 +531,37 @@ class Core {
 	 * Loose additionalProperties=true because list handlers may include extras like
 	 * featured_media_url that are host/plugin dependent.
 	 */
+	private static function revision_content_response_schema(): array {
+		return array(
+			'type'       => 'object',
+			'properties' => array(
+				'revision_id'    => array( 'type' => 'integer' ),
+				'parent_id'      => array( 'type' => 'integer' ),
+				'date'           => array( 'type' => 'string' ),
+				'author_name'    => array( 'type' => 'string' ),
+				'title'          => array( 'type' => 'string' ),
+				'content'        => array( 'type' => 'string' ),
+				'excerpt'        => array( 'type' => 'string' ),
+				'content_length' => array( 'type' => 'integer' ),
+			),
+		);
+	}
+
+	private static function revision_diff_response_schema(): array {
+		return array(
+			'type'       => 'object',
+			'properties' => array(
+				'from'          => array( 'type' => 'string' ),
+				'to'            => array( 'type' => 'string' ),
+				'identical'     => array( 'type' => 'boolean' ),
+				'diff'          => array( 'type' => 'string' ),
+				'lines_added'   => array( 'type' => 'integer' ),
+				'lines_removed' => array( 'type' => 'integer' ),
+				'truncated'     => array( 'type' => 'boolean' ),
+			),
+		);
+	}
+
 	private static function post_summary_schema(): array {
 		return array(
 			'type'                 => 'object',
@@ -538,6 +572,7 @@ class Core {
 				'status' => array( 'type' => 'string' ),
 				'url'    => array( 'type' => 'string' ),
 				'date'   => array( 'type' => 'string' ),
+				'content_length' => array( 'type' => 'integer' ),
 			),
 		);
 	}
@@ -562,8 +597,8 @@ class Core {
 	}
 
 	/**
-	 * Post write response — carries the actual saved values per INVARIANTS.md §11
-	 * (read-after-write verification catches silent-drop / silent-modify).
+	 * Post write response — carries the actual saved values from a read-after-write
+	 * verification to catch silent-drop / silent-modify failure classes.
 	 */
 	private static function post_write_response_schema(): array {
 		return array(
