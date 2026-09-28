@@ -244,7 +244,7 @@ class Elementor {
 			],
 			[
 				'name'        => 'elementor_rebuild_post_content_bulk',
-				'description' => 'Scan all posts with _elementor_data + empty post_content and rebuild them in batch. Fixes bulk SEO / search damage from prior clone operations that shipped without post_content. Pass dry_run=true to preview the count + first 20 candidate post IDs without writing. Batches up to limit posts per call (default 50, max 200). NO undo tokens emitted (bulk rebuild of empty content is generally not something users want to reverse — take a SiteVault snapshot beforehand if reversal capability matters). Cap: edit_posts.',
+				'description' => 'Scan all posts with _elementor_data + empty post_content and rebuild them in batch. Fixes bulk SEO / search damage from prior clone operations that shipped without post_content. Pass dry_run=true to preview the count + first 20 candidate post IDs without writing. Batches up to limit posts per call (default 50, max 200). NO undo tokens emitted (bulk rebuild of empty content is generally not something users want to reverse — take a SiteVault snapshot beforehand if reversal capability matters). Cap: edit_posts to enter the tool, then each individual post is re-checked with edit_post before its own rebuild — posts the caller cannot edit are skipped with reason=edit_post capability missing rather than failing the whole call.',
 				'inputSchema' => [
 					'type'       => 'object',
 					'properties' => [
@@ -791,7 +791,7 @@ class Elementor {
 		}
 
 		clean_post_cache( $post_id );
-		$new_length = strlen( (string) get_post( $post_id )->post_content );
+		$new_length = strlen( (string) get_post( $post_id )->post_content ); // audit:null-chain-ok -- post just rebuilt, existence confirmed above
 
 		// Undo envelope — restore prior post_content. Skip token if prior content
 		// exceeds the 1MB compressed cap.
@@ -908,7 +908,7 @@ class Elementor {
 				continue;
 			}
 			clean_post_cache( $pid );
-			$new_length = strlen( (string) get_post( $pid )->post_content );
+			$new_length = strlen( (string) get_post( $pid )->post_content ); // audit:null-chain-ok -- populate_post_content_from_elementor returned true, row exists
 			$repaired[] = [ 'post_id' => $pid, 'new_length' => $new_length ];
 		}
 
@@ -1690,13 +1690,38 @@ class Elementor {
 			'icon-box'       => [ 'title_text' ],
 			'call-to-action' => [ 'title' ],
 		];
-		if ( ! isset( $snippet_candidates[ $widget_type ] ) ) {
+		// Repeater widgets: [ repeater_key => item_text_key ].
+		$repeater_candidates = [
+			'icon-list' => [ 'repeater' => 'icon_list', 'field' => 'text' ],
+			'tabs'      => [ 'repeater' => 'tabs',      'field' => 'tab_title' ],
+			'accordion' => [ 'repeater' => 'tabs',      'field' => 'tab_title' ],
+			'toggle'    => [ 'repeater' => 'tabs',      'field' => 'tab_title' ],
+		];
+		if ( isset( $snippet_candidates[ $widget_type ] ) ) {
+			foreach ( $snippet_candidates[ $widget_type ] as $key ) {
+				if ( isset( $s[ $key ] ) && is_string( $s[ $key ] ) && $s[ $key ] !== '' ) {
+					$plain = wp_strip_all_tags( $s[ $key ] );
+					return mb_strimwidth( $plain, 0, 80, '...' );
+				}
+			}
 			return '';
 		}
-		foreach ( $snippet_candidates[ $widget_type ] as $key ) {
-			if ( isset( $s[ $key ] ) && is_string( $s[ $key ] ) && $s[ $key ] !== '' ) {
-				$plain = wp_strip_all_tags( $s[ $key ] );
-				return mb_strimwidth( $plain, 0, 80, '...' );
+		if ( isset( $repeater_candidates[ $widget_type ] ) ) {
+			$rep = $repeater_candidates[ $widget_type ]['repeater'];
+			$fld = $repeater_candidates[ $widget_type ]['field'];
+			if ( isset( $s[ $rep ] ) && is_array( $s[ $rep ] ) ) {
+				$parts = [];
+				foreach ( $s[ $rep ] as $item ) {
+					if ( is_array( $item ) && isset( $item[ $fld ] ) && is_string( $item[ $fld ] ) && $item[ $fld ] !== '' ) {
+						$parts[] = wp_strip_all_tags( $item[ $fld ] );
+					}
+					if ( count( $parts ) >= 6 ) {
+						break;
+					}
+				}
+				if ( ! empty( $parts ) ) {
+					return mb_strimwidth( implode( ' · ', $parts ), 0, 80, '...' );
+				}
 			}
 		}
 		return '';
@@ -1721,11 +1746,13 @@ class Elementor {
 			'no_found_rows'  => true,
 		];
 		if ( $type_filter !== '' ) {
-			$query_args['tax_query'] = [
+			// _elementor_template_type is the authoritative source across
+			// every Elementor template type (kit / header / footer / single /
+			// archive / popup have no taxonomy term).
+			$query_args['meta_query'] = [
 				[
-					'taxonomy' => 'elementor_library_type',
-					'field'    => 'slug',
-					'terms'    => $type_filter,
+					'key'   => '_elementor_template_type',
+					'value' => $type_filter,
 				],
 			];
 		}
@@ -1733,11 +1760,19 @@ class Elementor {
 
 		$templates = [];
 		foreach ( $posts as $tpl ) {
-			$terms = wp_get_post_terms( $tpl->ID, 'elementor_library_type', [ 'fields' => 'slugs' ] );
+			$meta_type = get_post_meta( $tpl->ID, '_elementor_template_type', true );
+			if ( is_string( $meta_type ) && $meta_type !== '' ) {
+				$type = $meta_type;
+			} else {
+				$terms = wp_get_post_terms( $tpl->ID, 'elementor_library_type', [ 'fields' => 'slugs' ] );
+				$type  = ( is_array( $terms ) && ! is_wp_error( $terms ) && ! empty( $terms ) )
+					? (string) $terms[0]
+					: 'unknown';
+			}
 			$templates[] = [
 				'id'            => (int) $tpl->ID,
 				'name'          => $tpl->post_title,
-				'type'          => is_array( $terms ) && ! is_wp_error( $terms ) && ! empty( $terms ) ? (string) $terms[0] : 'page',
+				'type'          => $type,
 				'date_modified' => $tpl->post_modified_gmt,
 			];
 		}

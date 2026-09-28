@@ -39,6 +39,26 @@ class Whats_New {
     }
 
     private function __construct() {
+        // Defer hook registration to plugins_loaded:20 so Pro's autoloader
+        // has fully run before we probe for its Whats_New class. Constructor
+        // fires at plugin-file-load time — before Pro's classes exist — so
+        // an inline class_exists check races and always returns false.
+        if ( did_action( 'plugins_loaded' ) ) {
+            $this->register_hooks();
+        } else {
+            add_action( 'plugins_loaded', [ $this, 'register_hooks' ], 20 );
+        }
+    }
+
+    /**
+     * Register admin-footer + enqueue + dismiss hooks. Skipped when Royal
+     * MCP Pro provides its own Whats_New surface (Pro's replaces ours
+     * entirely under parallel activation to avoid duplicate modals).
+     */
+    public function register_hooks(): void {
+        if ( class_exists( '\Royal_MCP_Pro\Admin\Whats_New', false ) ) {
+            return;
+        }
         add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_assets' ] );
         add_action( 'admin_footer',          [ $this, 'render_modal' ] );
         add_action( 'wp_ajax_' . self::DISMISS_AJAX_ACTION, [ $this, 'handle_dismiss' ] );
@@ -60,7 +80,7 @@ class Whats_New {
      * current plugin version. Used to decide auto-open on page load.
      */
     public function should_auto_open(): bool {
-        if ( ! current_user_can( 'manage_options' ) ) {
+        if ( ! current_user_can( 'manage_options' ) ) { // audit:multisite-manage-options-safe -- read-only per-user meta check (no state mutation)
             return false;
         }
         $seen = get_user_meta( get_current_user_id(), self::SEEN_VERSION_META, true );
@@ -149,7 +169,7 @@ class Whats_New {
         if ( ! $this->is_royal_mcp_admin_page() ) {
             return;
         }
-        if ( ! current_user_can( 'manage_options' ) ) {
+        if ( ! current_user_can( 'manage_options' ) ) { // audit:multisite-manage-options-safe -- read-only modal render (template include, no state mutation)
             return;
         }
         $template = ROYAL_MCP_PLUGIN_DIR . 'templates/admin/whats-new.php';
@@ -165,7 +185,7 @@ class Whats_New {
      * plugin version ships.
      */
     public function handle_dismiss(): void {
-        if ( ! current_user_can( 'manage_options' ) ) {
+        if ( ! current_user_can( 'manage_options' ) ) { // audit:multisite-manage-options-safe -- writes per-user meta only (no per-site or network-scope state)
             wp_send_json_error( [ 'message' => 'Insufficient permissions.' ], 403 );
         }
         check_ajax_referer( self::DISMISS_NONCE, 'nonce' );
