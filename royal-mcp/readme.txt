@@ -4,7 +4,7 @@ Donate link: https://www.royalplugins.com
 Tags: mcp, ai, claude, chatgpt, elementor
 Requires at least: 5.8
 Tested up to: 7.1
-Stable tag: 1.5.5
+Stable tag: 1.5.6
 Requires PHP: 7.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -74,9 +74,9 @@ The free [Royal AI Firewall](https://wordpress.org/plugins/royal-ai-firewall/) c
 
 Royal MCP publishes machine-readable MCP Server Card, Skills Index, and OAuth Protected Resource metadata at the standard well-known locations. Cloudflare's Agent Readiness scanner, Vercel's is-agentic, and Chrome Lighthouse's Agentic Browsing audit all recognize your site as agent-ready with zero configuration. Every request to your MCP endpoint carries a Link header pointing agent runtimes at these discovery documents.
 
-= 85 Core Tools + 124 Integration Tools =
+= 89 Core Tools + 124 Integration Tools =
 
-**WordPress Core (85 tools):**
+**WordPress Core (89 tools):**
 
 * Posts - create, read, update, delete, search, count (any registered public post type, featured images supported)
 * Pages - full CRUD with parent page support
@@ -200,7 +200,7 @@ Security. Most MCP plugins (and 41% of all public MCP servers) have no authentic
 
 = Does Royal MCP duplicate what WordPress core now does? =
 
-No. WordPress 6.9 added the Abilities API (a primitive for registering AI-callable functions), and the `wordpress/mcp-adapter` package bridges abilities to the MCP protocol. Royal MCP is a full MCP server with the security layer, connector flows, and plugin integrations the bare primitive does not include: enforced API key auth, OAuth 2.0 for Claude Desktop, per-IP rate limiting, audit logging, sensitive-data redaction, 85 ready-to-use WordPress core tools, and 124 integration tools for WooCommerce, GuardPress, Royal AI Firewall, SiteVault, ForgeCache, Royal Ledger, Royal Links, Elementor, Divi, ACF, Yoast SEO, UpdraftPlus, WPForms, Redirection, Solid Security, Contact Form 7, MonsterInsights, W3 Total Cache, Duplicator, and BuddyPress.
+No. WordPress 6.9 added the Abilities API (a primitive for registering AI-callable functions), and the `wordpress/mcp-adapter` package bridges abilities to the MCP protocol. Royal MCP is a full MCP server with the security layer, connector flows, and plugin integrations the bare primitive does not include: enforced API key auth, OAuth 2.0 for Claude Desktop, per-IP rate limiting, audit logging, sensitive-data redaction, 89 ready-to-use WordPress core tools, and 124 integration tools for WooCommerce, GuardPress, Royal AI Firewall, SiteVault, ForgeCache, Royal Ledger, Royal Links, Elementor, Divi, ACF, Yoast SEO, UpdraftPlus, WPForms, Redirection, Solid Security, Contact Form 7, MonsterInsights, W3 Total Cache, Duplicator, and BuddyPress.
 
 = Does Royal MCP work with WooCommerce? =
 
@@ -294,6 +294,9 @@ Every authenticated MCP request is logged to the Royal MCP activity log with tim
 10. Royal MCP tool list in ChatGPT after connection
 
 == Changelog ==
+
+= 1.5.6 =
+* Fix: OAuth connector compatibility across MCP clients.
 
 = 1.5.5 =
 * New: dry-run preview mode on high-blast option-write tools, a `wp_verify_rendered_page` tool for post-write confirmation, and a compact tool-discovery profile for context-limited AI clients.
